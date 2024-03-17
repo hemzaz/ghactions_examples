@@ -1,0 +1,94 @@
+name: Build and Push Conditionally to Amazon ECR
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  DIRECTORY_PATTERN: 'Program'
+  REGISTRY: YOUR_ECR_REGISTRY_URL
+  REPOSITORY_NAME: YOUR_ECR_REPOSITORY_NAME
+  AWS_REGION: YOUR_AWS_REGION
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Detect Changes in Services
+        id: set-matrix
+        run: |
+          #!/bin/bash
+          SERVICES=()
+          # Loop through modified files, populating SERVICES array
+          for file in $(git diff --name-only ${{ github.sha }}~1 ${{ github.sha }}); do
+            if [[ "$file" =~ ^${{ env.DIRECTORY_PATTERN }}/(.+)/ ]]; then
+              SERVICES+=("${BASH_REMATCH[1]}")
+            fi
+          done
+          # Remove duplicates
+          SERVICES=($(echo "${SERVICES[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+          # Create JSON array for the matrix
+          JSON_STRING='['
+          for service in "${SERVICES[@]}"; do
+            JSON_STRING+='{"service":"'"$service"'"},'
+          done
+          JSON_STRING=$(echo $JSON_STRING | sed 's/,$//')
+          JSON_STRING+=']'
+          # Set output
+          echo "::set-output name=matrix::${JSON_STRING}"
+
+  build-and-push:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{fromJson(needs.detect-changes.outputs.matrix)}}
+    steps:
+      - uses: actions/checkout@v2
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: elgohr/ecr-login-action@v3
+        with:
+          access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          region: ${{ env.AWS_REGION }}
+      - name: Set version tag
+        id: vars
+        run: echo "::set-output name=sha_short::$(git rev-parse --short HEAD)"
+      - name: Kaniko build and push
+        uses: aevea/action-kaniko@master
+        with:
+          registry: ${{ env.REGISTRY }}
+          image: ${{ env.REPOSITORY_NAME }}/{{ matrix.service }}
+          username: ${{ steps.ecr.outputs.username }}
+          password: ${{ steps.ecr.outputs.password }}
+          cache: true
+          cache_registry: ${{ env.REGISTRY }}/${{ env.REPOSITORY_NAME }}/{{ matrix.service }}/cache
+          tag_with_latest: true
+          tag: ${{ steps.vars.outputs.sha_short }}
+          path: .
+          build_file: Dockerfile
+          debug: true
+        continue-on-error: true
+        retry-on-error: true
+        max-attempts: 3
+      - name: Notify on failure
+        if: ${{ failure() }}
+        uses: 8398a7/action-notification@v3
+        with:
+          status: ${{ job.status }}
+          text: Image push to ECR failed for service {{ matrix.service }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Notify on success
+        if: ${{ success() }}
+        uses: 8398a7/action-notification@v3
+        with:
+          status: ${{ job.status }}
+          text: Image push to ECR successful for service {{ matrix.service }}
+          token: ${{ secrets.GITHUB_TOKEN }}
